@@ -145,6 +145,18 @@ for key, value in DEFAULT_KEYS.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
+if "batch_total_files" not in st.session_state:
+    st.session_state.batch_total_files = 0
+
+if "batch_processed_files" not in st.session_state:
+    st.session_state.batch_processed_files = 0
+
+if "batch_current_file" not in st.session_state:
+    st.session_state.batch_current_file = None
+
+if "batch_file_statuses" not in st.session_state:
+    st.session_state.batch_file_statuses = []
+
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
 
@@ -354,6 +366,114 @@ def record_agent_event(step, status, message=""):
     })
     refresh_live_activity()
 
+def refresh_live_batch_activity():
+    step_placeholder = st.session_state.get("live_step_placeholder")
+    progress_placeholder = st.session_state.get("live_progress_placeholder")
+    event_placeholder = st.session_state.get("live_event_placeholder")
+
+    total_files = st.session_state.get("batch_total_files", 0)
+    processed_files = st.session_state.get("batch_processed_files", 0)
+    current_file = st.session_state.get("batch_current_file")
+    current_step = st.session_state.get("current_step", "Waiting")
+    file_statuses = st.session_state.get("batch_file_statuses", [])
+    exception_count = len(st.session_state.get("exception_queue", []))
+
+    pct = int((processed_files / total_files) * 100) if total_files > 0 else int(st.session_state.get("progress_value", 0))
+
+    if step_placeholder is not None:
+        if total_files > 0:
+            step_placeholder.markdown(
+                f"""
+#### Batch Progress
+
+**Current File:** {current_file or "-"}  
+**Current Step:** {current_step}  
+**Processed:** {processed_files} / {total_files}  
+**Exceptions:** {exception_count}
+"""
+            )
+        else:
+            current_step_display = st.session_state.get("current_step", "Waiting")
+            if current_step_display != "Waiting":
+                step_placeholder.markdown(f"#### Progress\n\n**Current Step:** {current_step_display}")
+            else:
+                step_placeholder.empty()
+
+    if progress_placeholder is not None:
+        if total_files > 0 or st.session_state.get("progress_value", 0) > 0:
+            progress_placeholder.progress(pct)
+        else:
+            progress_placeholder.empty()
+
+    if event_placeholder is not None:
+        content = []
+
+        if total_files > 0:
+            content.append("#### File Queue")
+
+            if file_statuses:
+                for item in file_statuses:
+                    status = item.get("status", "pending")
+                    file_name = item.get("file_name", "")
+
+                    if status == "done":
+                        icon = "✅"
+                    elif status == "error":
+                        icon = "❌"
+                    elif status == "running":
+                        icon = "🔄"
+                    else:
+                        icon = "⏳"
+
+                    line = f"{icon} **{file_name}**"
+                    if item.get("message"):
+                        line += f"  \n{item.get('message')}"
+                    content.append(line)
+            else:
+                content.append("_No files started yet_")
+        else:
+            events = st.session_state.get("agent_events", [])
+            if events:
+                content.append("#### Completed Steps")
+                for event in events[-8:]:
+                    status = event.get("status", "pending")
+                    if status == "done":
+                        icon = "✅"
+                    elif status == "error":
+                        icon = "❌"
+                    elif status == "running":
+                        icon = "🔄"
+                    else:
+                        icon = "⏳"
+
+                    line = f"{icon} **{event.get('step', '')}**"
+                    if event.get("message"):
+                        line += f"  \n{event.get('message')}"
+                    content.append(line)
+
+        event_placeholder.markdown("\n\n".join(content) if content else "")
+
+
+def update_batch_file_status(file_name, status, message=""):
+    statuses = st.session_state.get("batch_file_statuses", [])
+
+    found = False
+    for item in statuses:
+        if item.get("file_name") == file_name:
+            item["status"] = status
+            item["message"] = message
+            found = True
+            break
+
+    if not found:
+        statuses.append({
+            "file_name": file_name,
+            "status": status,
+            "message": message
+        })
+
+    st.session_state["batch_file_statuses"] = statuses
+    refresh_live_batch_activity()
 
 def refresh_live_activity():
     step_placeholder = st.session_state.get("live_step_placeholder")
@@ -404,8 +524,7 @@ def refresh_live_activity():
 def update_progress(percent, message):
     st.session_state["progress_value"] = percent
     st.session_state["current_step"] = message
-    refresh_live_activity()
-
+    refresh_live_batch_activity()
 
 def get_suggested_questions(doc_type):
     if doc_type == "invoice":
@@ -803,7 +922,7 @@ def render_header():
 
 def render_sidebar_and_upload():
     with st.sidebar:
-        st.write(f"**{st.session_state['user']}**")
+        st.write(f"**Hi {st.session_state['user']}**")
 
         st.markdown("### Model")
         model_choice = st.selectbox(
@@ -842,11 +961,18 @@ def render_sidebar_and_upload():
             st.session_state.exception_queue = []
             st.session_state.batch_processed = False
             st.session_state.last_batch_signature = None
+            st.session_state.show_reprocess_confirm = False
+            st.session_state.pending_batch_signature = None
+            st.session_state.batch_total_files = 0
+            st.session_state.batch_processed_files = 0
+            st.session_state.batch_current_file = None
+            st.session_state.batch_file_statuses = []
             st.session_state.uploader_key += 1
             reset_run_state()
             st.rerun()
-
+        
     st.markdown("---")
+    
     return uploaded_files
 
 
@@ -1075,7 +1201,7 @@ with left_col:
     st.session_state["live_step_placeholder"] = st.empty()
     st.session_state["live_progress_placeholder"] = st.empty()
     st.session_state["live_event_placeholder"] = st.empty()
-    refresh_live_activity()
+    refresh_live_batch_activity()
 
     current_batch_signature = get_batch_signature(uploaded_files)
     last_batch_signature = st.session_state.get("last_batch_signature")
@@ -1092,12 +1218,37 @@ with left_col:
             st.session_state.show_reprocess_confirm = False
             st.session_state.pending_batch_signature = None
 
+            st.session_state.batch_total_files = len(uploaded_files)
+            st.session_state.batch_processed_files = 0
+            st.session_state.batch_current_file = None
+            st.session_state.batch_file_statuses = [
+                {"file_name": f.name, "status": "pending", "message": ""}
+                for f in uploaded_files
+            ]
+            refresh_live_batch_activity()
+
             for uploaded_file in uploaded_files:
+                st.session_state.batch_current_file = uploaded_file.name
+                update_batch_file_status(uploaded_file.name, "running", "Processing started")
+                refresh_live_batch_activity()
+
                 result = process_single_file(uploaded_file)
                 st.session_state.batch_results.append(result)
 
                 if result.get("status") == "Exception":
                     st.session_state.exception_queue.append(result)
+                    update_batch_file_status(
+                        uploaded_file.name,
+                        "error",
+                        result.get("exception_reason", "Exception")
+                    )
+                elif result.get("status") == "Review Needed":
+                    update_batch_file_status(uploaded_file.name, "done", "Review Needed")
+                else:
+                    update_batch_file_status(uploaded_file.name, "done", result.get("status", "Completed"))
+
+                st.session_state.batch_processed_files += 1
+                refresh_live_batch_activity()
 
             if st.session_state.batch_results:
                 load_batch_result_into_session(0)
@@ -1115,12 +1266,37 @@ with left_col:
                 st.session_state.batch_results = []
                 st.session_state.exception_queue = []
 
+                st.session_state.batch_total_files = len(uploaded_files or [])
+                st.session_state.batch_processed_files = 0
+                st.session_state.batch_current_file = None
+                st.session_state.batch_file_statuses = [
+                    {"file_name": f.name, "status": "pending", "message": ""}
+                    for f in (uploaded_files or [])
+                ]
+                refresh_live_batch_activity()
+
                 for uploaded_file in uploaded_files or []:
+                    st.session_state.batch_current_file = uploaded_file.name
+                    update_batch_file_status(uploaded_file.name, "running", "Re-processing started")
+                    refresh_live_batch_activity()
+
                     result = process_single_file(uploaded_file)
                     st.session_state.batch_results.append(result)
 
                     if result.get("status") == "Exception":
                         st.session_state.exception_queue.append(result)
+                        update_batch_file_status(
+                            uploaded_file.name,
+                            "error",
+                            result.get("exception_reason", "Exception")
+                        )
+                    elif result.get("status") == "Review Needed":
+                        update_batch_file_status(uploaded_file.name, "done", "Review Needed")
+                    else:
+                        update_batch_file_status(uploaded_file.name, "done", result.get("status", "Completed"))
+
+                    st.session_state.batch_processed_files += 1
+                    refresh_live_batch_activity()
 
                 if st.session_state.batch_results:
                     load_batch_result_into_session(0)
