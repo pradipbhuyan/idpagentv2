@@ -145,6 +145,9 @@ for key, value in DEFAULT_KEYS.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
+if "uploader_key" not in st.session_state:
+    st.session_state.uploader_key = 0
+
 if not st.session_state["logged_in"]:
     login()
     st.stop()
@@ -829,7 +832,7 @@ def render_sidebar_and_upload():
             "Upload document(s)",
             type=["txt", "pdf", "docx", "pptx", "xlsx", "png", "jpg", "jpeg"],
             accept_multiple_files=True,
-            key="main_file_uploader"
+            key=f"main_file_uploader_{st.session_state.uploader_key}"
         )
     with c2:
         st.write("")
@@ -839,6 +842,7 @@ def render_sidebar_and_upload():
             st.session_state.exception_queue = []
             st.session_state.batch_processed = False
             st.session_state.last_batch_signature = None
+            st.session_state.uploader_key += 1
             reset_run_state()
             st.rerun()
 
