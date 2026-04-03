@@ -3,18 +3,14 @@
 # OCR FALLBACK + BATCH + EXCEPTION QUEUE
 # ==============================
 
-import re
-import json
 import time
 import tempfile
 import hashlib
-import traceback
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-from openai import OpenAI
 from docx import Document as DocxDocument
 from pptx import Presentation
 
@@ -31,12 +27,13 @@ from core import (
     validate_document_data,
     build_confidence_map,
     classify_exception,
-    needs_ocr_fallback,
     extract_text_from_pdf_with_ocr_fallback,
     ocr_image_bytes_with_vlm,
-    json_to_kv_dataframe,
 )
 
+# ------------------------------
+# PAGE CONFIG
+# ------------------------------
 st.set_page_config("IDP - Professional", layout="wide")
 USERS = st.secrets.get("users", {})
 
@@ -47,6 +44,7 @@ USERS = st.secrets.get("users", {})
 def get_llm(api_key, model):
     return ChatOpenAI(model=model, temperature=0, api_key=api_key)
 
+
 @st.cache_resource
 def get_embeddings(api_key):
     return OpenAIEmbeddings(api_key=api_key)
@@ -56,8 +54,12 @@ def get_embeddings(api_key):
 # ------------------------------
 def validate_api_key(api_key):
     try:
-        client = OpenAI(api_key=api_key)
-        client.models.list()
+        llm = ChatOpenAI(
+            model="gpt-4o-mini",
+            temperature=0,
+            api_key=api_key
+        )
+        llm.invoke("Reply with OK")
         return True
     except Exception:
         return False
@@ -117,6 +119,8 @@ DEFAULT_KEYS = {
     "batch_results": [],
     "exception_queue": [],
     "active_batch_index": 0,
+    "batch_processed": False,
+    "last_batch_signature": None,
     "review_data": None,
     "confidence_map": None,
     "validation_result": None,
@@ -137,9 +141,9 @@ DEFAULT_KEYS = {
     "live_event_placeholder": None,
 }
 
-for k, v in DEFAULT_KEYS.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+for key, value in DEFAULT_KEYS.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
 if not st.session_state["logged_in"]:
     login()
@@ -164,6 +168,9 @@ def reset_run_state():
     st.session_state["agent_logs"] = []
     st.session_state["current_step"] = "Waiting"
     st.session_state["progress_value"] = 0
+    st.session_state["live_step_placeholder"] = None
+    st.session_state["live_progress_placeholder"] = None
+    st.session_state["live_event_placeholder"] = None
 
 
 def save_temp_file(uploaded_file):
@@ -180,10 +187,10 @@ def load_default_resume_template_bytes():
         Path(__file__).parent / "templates" / "resume_template.docx",
         Path(__file__).parent / "templates:resume_template.docx",
     ]
-    for p in possible_paths:
-        if p.exists():
-            with open(p, "rb") as f:
-                return f.read()
+    for path in possible_paths:
+        if path.exists():
+            with open(path, "rb") as file:
+                return file.read()
     return None
 
 
@@ -191,9 +198,9 @@ def extract_docx_text(file_path):
     doc = DocxDocument(file_path)
     parts = []
 
-    for p in doc.paragraphs:
-        if p.text and p.text.strip():
-            parts.append(p.text.strip())
+    for paragraph in doc.paragraphs:
+        if paragraph.text and paragraph.text.strip():
+            parts.append(paragraph.text.strip())
 
     for table in doc.tables:
         for row in table.rows:
@@ -206,18 +213,18 @@ def extract_docx_text(file_path):
 
 def process_file_with_fallback(uploaded_file):
     suffix = Path(uploaded_file.name).suffix.lower()
-
     uploaded_file.seek(0)
 
     if suffix in [".png", ".jpg", ".jpeg"]:
         image_bytes = uploaded_file.getvalue()
-        text = ocr_image_bytes_with_vlm(image_bytes, mime_type=f"image/{suffix.replace('.', '')}")
+        mime_type = "image/jpeg" if suffix in [".jpg", ".jpeg"] else "image/png"
+        text = ocr_image_bytes_with_vlm(image_bytes, mime_type=mime_type)
         return {
             "documents": [Document(page_content=text)] if text else [],
             "text": text,
             "ocr_used": True,
             "extraction_mode": "image_vlm_ocr",
-            "exception_reason": None if text else "OCR failed on image"
+            "exception_reason": None if text else "OCR failed on image",
         }
 
     file_path = save_temp_file(uploaded_file)
@@ -228,13 +235,14 @@ def process_file_with_fallback(uploaded_file):
                 docs = TextLoader(file_path, encoding="utf-8").load()
             except Exception:
                 docs = TextLoader(file_path, encoding="cp1252").load()
+
             text = "\n".join([d.page_content for d in docs]).strip()
             return {
                 "documents": docs,
                 "text": text,
                 "ocr_used": False,
                 "extraction_mode": "plain_text",
-                "exception_reason": None
+                "exception_reason": None,
             }
 
         if suffix == ".pdf":
@@ -256,7 +264,7 @@ def process_file_with_fallback(uploaded_file):
                 "text": text,
                 "ocr_used": False,
                 "extraction_mode": "docx_text",
-                "exception_reason": None if text else "No extractable text in DOCX"
+                "exception_reason": None if text else "No extractable text in DOCX",
             }
 
         if suffix == ".pptx":
@@ -273,7 +281,7 @@ def process_file_with_fallback(uploaded_file):
                 "text": text,
                 "ocr_used": False,
                 "extraction_mode": "pptx_text",
-                "exception_reason": None if text else "No extractable text in PPTX"
+                "exception_reason": None if text else "No extractable text in PPTX",
             }
 
         if suffix == ".xlsx":
@@ -290,7 +298,7 @@ def process_file_with_fallback(uploaded_file):
                 "text": text,
                 "ocr_used": False,
                 "extraction_mode": "xlsx_text",
-                "exception_reason": None if text else "No extractable text in Excel"
+                "exception_reason": None if text else "No extractable text in Excel",
             }
 
     except Exception as e:
@@ -299,7 +307,7 @@ def process_file_with_fallback(uploaded_file):
             "text": "",
             "ocr_used": False,
             "extraction_mode": "failed",
-            "exception_reason": str(e)
+            "exception_reason": str(e),
         }
 
     return {
@@ -307,7 +315,7 @@ def process_file_with_fallback(uploaded_file):
         "text": "",
         "ocr_used": False,
         "extraction_mode": "unsupported",
-        "exception_reason": f"Unsupported file type: {suffix}"
+        "exception_reason": f"Unsupported file type: {suffix}",
     }
 
 
@@ -352,7 +360,6 @@ def refresh_live_activity():
     current_step = st.session_state.get("current_step", "Waiting")
     progress_value = int(st.session_state.get("progress_value", 0))
     events = st.session_state.get("agent_events", [])
-    logs = st.session_state.get("agent_logs", [])
 
     has_started = len(events) > 0 or progress_value > 0 or current_step != "Waiting"
 
@@ -376,17 +383,17 @@ def refresh_live_activity():
         content = ["#### Completed Steps"]
         for event in events[-10:]:
             status = event.get("status", "pending")
-            icon = "✅" if status == "done" else "❌" if status == "error" else "🔄"
+            if status == "done":
+                icon = "✅"
+            elif status == "error":
+                icon = "❌"
+            else:
+                icon = "🔄"
+
             line = f"{icon} **{event.get('step', '')}**"
             if event.get("message"):
                 line += f"  \n{event.get('message')}"
             content.append(line)
-
-        if logs:
-            content.append("---")
-            content.append("**Recent Logs**")
-            for log in logs[-5:]:
-                content.append(f"- {log}")
 
         event_placeholder.markdown("\n\n".join(content))
 
@@ -413,7 +420,7 @@ def normalize_graph_result(result):
             "doc_type": None,
             "structured_data": None,
             "result": {},
-            "error": "Graph returned non-dict output"
+            "error": "Graph returned non-dict output",
         }
 
     doc_type = result.get("doc_type") or result.get("type")
@@ -484,10 +491,8 @@ def process_single_file(uploaded_file):
         "exception_reason": extracted["exception_reason"],
     }
 
-    before = {
-        "cost": st.session_state["metrics"]["cost"],
-        "tokens": st.session_state["metrics"]["tokens"],
-    }
+    before_cost = st.session_state["metrics"]["cost"]
+    before_tokens = st.session_state["metrics"]["tokens"]
 
     raw_result = graph.invoke(graph_input)
     normalized = normalize_graph_result(raw_result)
@@ -522,10 +527,8 @@ def process_single_file(uploaded_file):
     st.session_state.generated_resume = result.get("file")
     st.session_state.suggested_questions = get_suggested_questions(doc_type)
 
-    after = {
-        "cost": st.session_state["metrics"]["cost"],
-        "tokens": st.session_state["metrics"]["tokens"],
-    }
+    after_cost = st.session_state["metrics"]["cost"]
+    after_tokens = st.session_state["metrics"]["tokens"]
 
     status = "Completed"
     if exception_reason:
@@ -548,8 +551,8 @@ def process_single_file(uploaded_file):
         "auto_result": st.session_state.auto_result,
         "vectorstore": vectorstore,
         "full_text": full_text,
-        "cost": round(after["cost"] - before["cost"], 6),
-        "tokens": after["tokens"] - before["tokens"],
+        "cost": round(after_cost - before_cost, 6),
+        "tokens": after_tokens - before_tokens,
     }
 
 
@@ -568,6 +571,33 @@ def load_batch_result_into_session(index):
     st.session_state.vectorstore = item.get("vectorstore")
     st.session_state.full_text = item.get("full_text")
     st.session_state.generated_resume = ((item.get("auto_result") or {}).get("result") or {}).get("file")
+
+
+def get_batch_signature(uploaded_files):
+    if not uploaded_files:
+        return None
+
+    parts = []
+    for file in uploaded_files:
+        try:
+            content_hash = hashlib.md5(file.getvalue()).hexdigest()
+        except Exception:
+            content_hash = f"{file.name}-{len(file.getvalue())}"
+        parts.append(f"{file.name}:{content_hash}")
+
+    return "|".join(parts)
+
+
+def go_to_next_batch_result():
+    batch_results = st.session_state.get("batch_results", [])
+    if not batch_results:
+        return
+
+    current_index = st.session_state.get("active_batch_index", 0)
+    next_index = current_index + 1
+
+    if next_index < len(batch_results):
+        load_batch_result_into_session(next_index)
 
 
 def compact_field(label, value):
@@ -601,6 +631,7 @@ def render_confidence_table():
     confidence = st.session_state.get("confidence_map") or {}
     if not confidence:
         return
+
     rows = [{"Field": k, "Confidence": v.get("label", "-"), "Reason": v.get("reason", "-")} for k, v in confidence.items()]
     st.markdown("#### Confidence")
     st.dataframe(pd.DataFrame(rows), use_container_width=True, height=220, hide_index=True)
@@ -806,6 +837,8 @@ def render_sidebar_and_upload():
         if st.button("Reset", use_container_width=True):
             st.session_state.batch_results = []
             st.session_state.exception_queue = []
+            st.session_state.batch_processed = False
+            st.session_state.last_batch_signature = None
             reset_run_state()
             st.rerun()
 
@@ -823,6 +856,10 @@ def render_result_workspace():
     doc_type = st.session_state.get("doc_type")
     result = st.session_state.get("auto_result", {}).get("result", {})
     data = st.session_state.get("review_data") or {}
+
+    current_index = st.session_state.get("active_batch_index", 0)
+    total_results = len(st.session_state.get("batch_results", []))
+    has_next = current_index < (total_results - 1)
 
     if doc_type == "invoice":
         c1, c2, c3, c4 = st.columns(4)
@@ -844,10 +881,11 @@ def render_result_workspace():
         with st.expander("Review & Edit", expanded=True):
             render_invoice_review_form()
 
-        b1, b2 = st.columns(2)
+        b1, b2, b3 = st.columns(3)
         with b1:
-            if st.button("Approve & Send to Concur", use_container_width=True):
+            if st.button("Approve & Send to Concur", use_container_width=True, key="invoice_send"):
                 handle_invoice_or_ticket_submission("invoice")
+
         with b2:
             excel = result.get("excel")
             if excel:
@@ -857,6 +895,32 @@ def render_result_workspace():
                     f"{(data.get('invoice_number') or data.get('vendor') or 'invoice_data')}.xlsx",
                     use_container_width=True
                 )
+
+        with b3:
+            if st.button("Next Document", use_container_width=True, disabled=not has_next, key="invoice_next"):
+                go_to_next_batch_result()
+                st.rerun()
+
+        if result.get("concur_status"):
+            st.markdown("#### Concur Delivery")
+            c7, c8, c9 = st.columns(3)
+            with c7:
+                compact_field("Status", str(result.get("concur_status", "-")).title())
+            with c8:
+                compact_field("Mode", str(result.get("concur_mode", "-")).upper())
+            with c9:
+                compact_field("Submission ID", str(result.get("concur_submission_id", "-")))
+
+            st.markdown(
+                f"<small><b>Batch ID:</b> {result.get('concur_batch_id', '-')} | "
+                f"<b>Document ID:</b> {result.get('concur_document_id', '-')}</small>",
+                unsafe_allow_html=True
+            )
+            st.markdown(
+                f"<small><b>Submitted At:</b> {result.get('concur_submitted_at', '-')} | "
+                f"<b>Processing:</b> {result.get('concur_processing_state', '-')}</small>",
+                unsafe_allow_html=True
+            )
 
     elif doc_type == "ticket":
         c1, c2, c3, c4 = st.columns(4)
@@ -878,11 +942,39 @@ def render_result_workspace():
         with st.expander("Review & Edit", expanded=True):
             render_ticket_review_form()
 
-        if st.button("Approve & Send to Concur", use_container_width=True):
-            handle_invoice_or_ticket_submission("ticket")
+        a1, a2 = st.columns(2)
+        with a1:
+            if st.button("Approve & Send to Concur", use_container_width=True, key="ticket_send"):
+                handle_invoice_or_ticket_submission("ticket")
+
+        with a2:
+            if st.button("Next Document", use_container_width=True, disabled=not has_next, key="ticket_next"):
+                go_to_next_batch_result()
+                st.rerun()
+
+        if result.get("concur_status"):
+            st.markdown("#### Concur Delivery")
+            c5, c6, c7 = st.columns(3)
+            with c5:
+                compact_field("Status", str(result.get("concur_status", "-")).title())
+            with c6:
+                compact_field("Mode", str(result.get("concur_mode", "-")).upper())
+            with c7:
+                compact_field("Submission ID", str(result.get("concur_submission_id", "-")))
+
+            st.markdown(
+                f"<small><b>Batch ID:</b> {result.get('concur_batch_id', '-')} | "
+                f"<b>Document ID:</b> {result.get('concur_document_id', '-')}</small>",
+                unsafe_allow_html=True
+            )
+            st.markdown(
+                f"<small><b>Submitted At:</b> {result.get('concur_submitted_at', '-')} | "
+                f"<b>Processing:</b> {result.get('concur_processing_state', '-')}</small>",
+                unsafe_allow_html=True
+            )
 
     elif doc_type == "resume":
-        top1, top2 = st.columns([2, 1])
+        top1, top2, top3 = st.columns([2, 1, 1])
         with top1:
             st.caption(f"Output File: {result.get('file_name', 'generated_resume.docx')}")
         with top2:
@@ -894,6 +986,10 @@ def render_result_workspace():
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     use_container_width=True
                 )
+        with top3:
+            if st.button("Next Document", use_container_width=True, disabled=not has_next, key="resume_next"):
+                go_to_next_batch_result()
+                st.rerun()
 
         render_validation_summary()
         render_confidence_table()
@@ -901,13 +997,17 @@ def render_result_workspace():
         with st.expander("Review & Edit", expanded=True):
             render_resume_review_form()
 
-        if st.button("Regenerate Resume", use_container_width=True):
+        if st.button("Regenerate Resume", use_container_width=True, key="resume_regen"):
             regenerate_resume_from_review()
 
     else:
         text = st.session_state.get("full_text", "")
         if text:
             st.text_area("Preview", value=text[:2500], height=180, label_visibility="collapsed")
+
+        if st.button("Next Document", use_container_width=True, disabled=not has_next, key="generic_next"):
+            go_to_next_batch_result()
+            st.rerun()
 
 
 def render_batch_table():
@@ -917,9 +1017,8 @@ def render_batch_table():
         return
 
     rows = []
-    for i, item in enumerate(st.session_state.batch_results):
+    for item in st.session_state.batch_results:
         rows.append({
-            "Index": i,
             "File": item.get("file_name"),
             "Type": item.get("doc_type"),
             "Status": item.get("status"),
@@ -929,7 +1028,7 @@ def render_batch_table():
         })
 
     df = pd.DataFrame(rows)
-    st.dataframe(df.drop(columns=["Index"]), use_container_width=True, hide_index=True, height=220)
+    st.dataframe(df, use_container_width=True, hide_index=True, height=220)
 
     selected = st.selectbox(
         "Open processed document",
@@ -948,9 +1047,8 @@ def render_exception_queue():
         return
 
     rows = []
-    for i, item in enumerate(st.session_state.exception_queue):
+    for item in st.session_state.exception_queue:
         rows.append({
-            "Index": i,
             "File": item.get("file_name"),
             "Type": item.get("doc_type"),
             "Reason": item.get("exception_reason"),
@@ -958,7 +1056,7 @@ def render_exception_queue():
         })
 
     df = pd.DataFrame(rows)
-    st.dataframe(df.drop(columns=["Index"]), use_container_width=True, hide_index=True, height=200)
+    st.dataframe(df, use_container_width=True, hide_index=True, height=200)
 
 # ------------------------------
 # MAIN
@@ -975,7 +1073,18 @@ with left_col:
     st.session_state["live_event_placeholder"] = st.empty()
     refresh_live_activity()
 
-    if uploaded_files and st.button("Process Batch", use_container_width=True):
+    current_batch_signature = get_batch_signature(uploaded_files)
+
+    if current_batch_signature != st.session_state.get("last_batch_signature"):
+        st.session_state.batch_processed = False
+        st.session_state.last_batch_signature = current_batch_signature
+
+    process_disabled = (
+        not uploaded_files or
+        st.session_state.get("batch_processed", False)
+    )
+
+    if st.button("Process Batch", use_container_width=True, disabled=process_disabled):
         st.session_state.batch_results = []
         st.session_state.exception_queue = []
 
@@ -988,6 +1097,7 @@ with left_col:
 
         if st.session_state.batch_results:
             load_batch_result_into_session(0)
+            st.session_state.batch_processed = True
             st.success("Batch processing completed")
 
 with right_col:
