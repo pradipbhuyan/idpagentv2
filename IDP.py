@@ -1074,32 +1074,67 @@ with left_col:
     refresh_live_activity()
 
     current_batch_signature = get_batch_signature(uploaded_files)
+    last_batch_signature = st.session_state.get("last_batch_signature")
 
-    if current_batch_signature != st.session_state.get("last_batch_signature"):
-        st.session_state.batch_processed = False
-        st.session_state.last_batch_signature = current_batch_signature
-
-    process_disabled = (
-        not uploaded_files or
-        st.session_state.get("batch_processed", False)
-    )
+    process_disabled = not uploaded_files
 
     if st.button("Process Batch", use_container_width=True, disabled=process_disabled):
-        st.session_state.batch_results = []
-        st.session_state.exception_queue = []
+        if current_batch_signature and current_batch_signature == last_batch_signature:
+            st.session_state.show_reprocess_confirm = True
+            st.session_state.pending_batch_signature = current_batch_signature
+        else:
+            st.session_state.batch_results = []
+            st.session_state.exception_queue = []
+            st.session_state.show_reprocess_confirm = False
+            st.session_state.pending_batch_signature = None
 
-        for uploaded_file in uploaded_files:
-            result = process_single_file(uploaded_file)
-            st.session_state.batch_results.append(result)
+            for uploaded_file in uploaded_files:
+                result = process_single_file(uploaded_file)
+                st.session_state.batch_results.append(result)
 
-            if result.get("status") == "Exception":
-                st.session_state.exception_queue.append(result)
+                if result.get("status") == "Exception":
+                    st.session_state.exception_queue.append(result)
 
-        if st.session_state.batch_results:
-            load_batch_result_into_session(0)
-            st.session_state.batch_processed = True
-            st.success("Batch processing completed")
+            if st.session_state.batch_results:
+                load_batch_result_into_session(0)
+                st.session_state.batch_processed = True
+                st.session_state.last_batch_signature = current_batch_signature
+                st.success("Batch processing completed")
 
+    if st.session_state.get("show_reprocess_confirm"):
+        st.warning("This same batch was already processed. Do you want to re-process it again?")
+
+        c1, c2 = st.columns(2)
+
+        with c1:
+            if st.button("Yes, Re-process", use_container_width=True):
+                st.session_state.batch_results = []
+                st.session_state.exception_queue = []
+
+                for uploaded_file in uploaded_files or []:
+                    result = process_single_file(uploaded_file)
+                    st.session_state.batch_results.append(result)
+
+                    if result.get("status") == "Exception":
+                        st.session_state.exception_queue.append(result)
+
+                if st.session_state.batch_results:
+                    load_batch_result_into_session(0)
+                    st.session_state.batch_processed = True
+                    st.session_state.last_batch_signature = st.session_state.get("pending_batch_signature")
+                    st.success("Batch re-processing completed")
+
+                st.session_state.show_reprocess_confirm = False
+                st.session_state.pending_batch_signature = None
+                st.rerun()
+
+        with c2:
+            if st.button("No", use_container_width=True):
+                st.session_state.show_reprocess_confirm = False
+                st.session_state.pending_batch_signature = None
+                st.info("Re-processing cancelled")
+                st.rerun()
+                
 with right_col:
     render_result_workspace()
 
